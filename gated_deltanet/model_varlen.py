@@ -377,18 +377,19 @@ class GatedDeltaNetVarlen(nn.Module):
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
         
         # Apply gated delta rule on packed format
-        if chunk_gated_delta_rule is not None and hasattr(chunk_gated_delta_rule, '__code__') and 'cu_seqlens' in chunk_gated_delta_rule.__code__.co_varnames:
-            # Use fast implementation if it supports cu_seqlens
-            # This would need proper API from flash-linear-attention
-            core_attn_out = chunk_gated_delta_rule(
-                query.unsqueeze(0),
+        if chunk_gated_delta_rule is not None:
+            # Use flash-linear-attention implementation with varlen support
+            # Reshape to (1, total_tokens, num_heads, dim) as required by fla
+            core_attn_out, _ = chunk_gated_delta_rule(
+                query.unsqueeze(0),  # (1, total_tokens, num_heads, head_k_dim)
                 key.unsqueeze(0),
                 value.unsqueeze(0),
-                g=g.unsqueeze(0),
+                g=g.unsqueeze(0),  # (1, total_tokens, num_heads)
                 beta=beta.unsqueeze(0),
-                chunk_size=self.config.chunk_size,
+                cu_seqlens=cu_seqlens.to(torch.long),  # fla requires LongTensor
                 use_qk_l2norm_in_kernel=self.config.use_qk_l2norm,
-            )[0]
+            )
+            core_attn_out = core_attn_out.squeeze(0)  # (total_tokens, num_heads, head_v_dim)
         else:
             # Torch fallback - process each sequence independently on packed format
             core_attn_out = torch_chunk_gated_delta_rule_varlen(
