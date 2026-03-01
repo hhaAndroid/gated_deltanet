@@ -1,0 +1,62 @@
+name: Lint
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.12']
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Cache pip packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/setup.py', '**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install black flake8 isort mypy
+
+    - name: Check code formatting with black
+      run: |
+        black --check --diff gated_deltanet/ tests/
+      continue-on-error: false
+
+    - name: Check import sorting with isort
+      run: |
+        isort --check-only --diff gated_deltanet/ tests/
+      continue-on-error: false
+
+    - name: Lint with flake8
+      run: |
+        # E501: line too long (handled by black)
+        # W503: line break before binary operator (conflicts with black)
+        flake8 gated_deltanet/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 gated_deltanet/ tests/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics --ignore=E501,W503
+
+    - name: Type check with mypy (optional)
+      run: |
+        mypy gated_deltanet/ --ignore-missing-imports || true
+      continue-on-error: true
+
+    - name: Report status
+      if: always()
+      run: |
+        echo "Lint check completed!"
