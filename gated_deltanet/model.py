@@ -1,9 +1,9 @@
-"""GatedDeltaNet implementation based on Qwen3.5 MoE.
+"""GatedDeltaNet implementation based on Qwen3.5 MoE - Training only version.
 
 Reference: https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py
 """
 import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -13,41 +13,22 @@ from .config import GatedDeltaNetConfig
 
 # Try to import fast implementations
 try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    from causal_conv1d import causal_conv1d_fn
 except ImportError:
-    causal_conv1d_fn, causal_conv1d_update = None, None
+    causal_conv1d_fn = None
 
 try:
     from fla.modules import FusedRMSNormGated
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 except ImportError:
     FusedRMSNormGated = None
     chunk_gated_delta_rule = None
-    fused_recurrent_gated_delta_rule = None
 
 
 def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     """L2 normalization."""
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
     return x * inv_norm
-
-
-def torch_causal_conv1d_update(
-    hidden_states: torch.Tensor,
-    conv_state: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    activation: str = "silu",
-) -> torch.Tensor:
-    """Torch implementation of causal conv1d update for single token."""
-    _, hidden_size, seq_len = hidden_states.shape
-    state_len = conv_state.shape[-1]
-    
-    hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
-    conv_state.copy_(hidden_states_new[:, :, -state_len:])
-    out = F.conv1d(hidden_states_new, weight.unsqueeze(1), bias, padding=0, groups=hidden_size)
-    out = F.silu(out[:, :, -seq_len:])
-    return out.to(hidden_states.dtype)
 
 
 def torch_chunk_gated_delta_rule(
@@ -57,11 +38,9 @@ def torch_chunk_gated_delta_rule(
     g: torch.Tensor,
     beta: torch.Tensor,
     chunk_size: int = 64,
-    initial_state: Optional[torch.Tensor] = None,
-    output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Torch implementation of chunk gated delta rule.
+) -> torch.Tensor:
+    """Torch implementation of chunk gated delta rule (training only).
     
     Args:
         query: (batch, num_heads, seq_len, head_dim)
@@ -70,13 +49,10 @@ def torch_chunk_gated_delta_rule(
         g: (batch, num_heads, seq_len) - gate values
         beta: (batch, num_heads, seq_len) - beta values
         chunk_size: chunk size for processing
-        initial_state: initial recurrent state
-        output_final_state: whether to output final state
         use_qk_l2norm_in_kernel: whether to use L2 norm for Q/K
     
     Returns:
         output: (batch, seq_len, num_heads, head_dim_v)
-        final_state: final recurrent state (if output_final_state=True)
     """
     initial_dtype = query.dtype
     
@@ -135,10 +111,7 @@ def torch_chunk_gated_delta_rule(
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
     
     # Initialize recurrent state
-    if initial_state is None:
-        last_recurrent_state = torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, device=value.device, dtype=value.dtype)
-    else:
-        last_recurrent_state = initial_state.to(value.dtype)
+    last_recurrent_state = torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, device=value.device, dtype=value.dtype)
     
     core_attn_out = torch.zeros_like(value)
     mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
@@ -164,81 +137,7 @@ def torch_chunk_gated_delta_rule(
     core_attn_out = core_attn_out[:, :, :seq_len]
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     
-    if not output_final_state:
-        last_recurrent_state = None
-    
-    return core_attn_out, last_recurrent_state
-
-
-def torch_recurrent_gated_delta_rule(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: Optional[torch.Tensor] = None,
-    output_final_state: bool = False,
-    use_qk_l2norm_in_kernel: bool = False,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Torch implementation of recurrent gated delta rule for single token generation.
-    
-    Args:
-        query: (batch, num_heads, seq_len, head_dim)
-        key: (batch, num_heads, seq_len, head_dim)
-        value: (batch, num_heads, seq_len, head_dim_v)
-        g: (batch, num_heads, seq_len)
-        beta: (batch, num_heads, seq_len)
-        initial_state: initial recurrent state
-        output_final_state: whether to output final state
-        use_qk_l2norm_in_kernel: whether to use L2 norm for Q/K
-    
-    Returns:
-        output: (batch, seq_len, num_heads, head_dim_v)
-        final_state: final recurrent state
-    """
-    initial_dtype = query.dtype
-    
-    if use_qk_l2norm_in_kernel:
-        query = l2norm(query, dim=-1, eps=1e-6)
-        key = l2norm(key, dim=-1, eps=1e-6)
-    
-    query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32)
-        for x in (query, key, value, beta, g)
-    ]
-    
-    batch_size, num_heads, seq_len, k_head_dim = key.shape
-    v_head_dim = value.shape[-1]
-    
-    core_attn_out = torch.zeros(batch_size, num_heads, seq_len, v_head_dim, device=value.device, dtype=value.dtype)
-    
-    if initial_state is None:
-        last_recurrent_state = torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, device=value.device, dtype=value.dtype)
-    else:
-        last_recurrent_state = initial_state.to(value.dtype)
-    
-    scale = 1.0 / math.sqrt(query.shape[-1])
-    query = query * scale
-    
-    # Process each token
-    for i in range(seq_len):
-        q_t = query[:, :, i]
-        k_t = key[:, :, i]
-        v_t = value[:, :, i]
-        g_t = g[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
-        beta_t = beta[:, :, i].unsqueeze(-1)
-        
-        last_recurrent_state = last_recurrent_state * g_t
-        kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
-        delta = (v_t - kv_mem) * beta_t
-        last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
-        core_attn_out[:, :, i] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
-    
-    if not output_final_state:
-        last_recurrent_state = None
-    
-    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
-    return core_attn_out, last_recurrent_state
+    return core_attn_out
 
 
 class RMSNormGated(nn.Module):
@@ -260,12 +159,10 @@ class RMSNormGated(nn.Module):
 
 
 class GatedDeltaNet(nn.Module):
-    """Gated DeltaNet layer (non-varlen version).
+    """Gated DeltaNet layer for training (no cache support).
     
-    This is the standard implementation that assumes all sequences in a batch
-    have the same length.
-    
-    Reference: Qwen3_5MoeGatedDeltaNet from transformers
+    This is a simplified implementation focused on training only.
+    All cache-related parameters and logic have been removed.
     """
     
     def __init__(self, config: GatedDeltaNetConfig, layer_idx: int = 0):
@@ -317,35 +214,24 @@ class GatedDeltaNet(nn.Module):
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         
-        # Select implementations
-        self.causal_conv1d_fn = causal_conv1d_fn
-        self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
+        # Select implementation
         self.chunk_gated_delta_rule_fn = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
-        self.recurrent_gated_delta_rule_fn = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
     
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor, ...]] = None,
-        use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, ...]]]:
-        """Forward pass.
+    ) -> torch.Tensor:
+        """Forward pass for training.
         
         Args:
             hidden_states: (batch, seq_len, hidden_size)
-            attention_mask: optional attention mask
-            past_key_value: cached states for generation
-            use_cache: whether to use cache
+            attention_mask: optional attention mask (not used in training mode)
         
         Returns:
             output: (batch, seq_len, hidden_size)
-            past_key_value: updated cache (if use_cache=True)
         """
         batch_size, seq_len, _ = hidden_states.shape
-        
-        # Check if we're in generation mode (seq_len=1 with cache)
-        use_cache_mode = past_key_value is not None and seq_len == 1
         
         # Input projections
         mixed_qkv = self.in_proj_qkv(hidden_states)
@@ -358,35 +244,15 @@ class GatedDeltaNet(nn.Module):
         a = self.in_proj_a(hidden_states)
         
         # Causal convolution
-        if use_cache_mode:
-            # Single token generation
-            conv_state = past_key_value[0] if past_key_value is not None else None
-            if conv_state is None:
-                # Initialize conv state
-                conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
-            
-            mixed_qkv = self.causal_conv1d_update(
-                mixed_qkv,
-                conv_state,
-                self.conv1d.weight.squeeze(1),
-                self.conv1d.bias if hasattr(self.conv1d, 'bias') else None,
-                self.config.hidden_act,
+        if causal_conv1d_fn is not None:
+            mixed_qkv = causal_conv1d_fn(
+                x=mixed_qkv,
+                weight=self.conv1d.weight.squeeze(1),
+                bias=self.conv1d.bias if hasattr(self.conv1d, 'bias') else None,
+                activation=self.config.hidden_act,
             )
         else:
-            # Training / prefill mode
-            if self.causal_conv1d_fn is not None:
-                mixed_qkv = self.causal_conv1d_fn(
-                    x=mixed_qkv,
-                    weight=self.conv1d.weight.squeeze(1),
-                    bias=self.conv1d.bias if hasattr(self.conv1d, 'bias') else None,
-                    activation=self.config.hidden_act,
-                )
-            else:
-                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
-            
-            if use_cache:
-                # Store conv state for future generation
-                conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
+            mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
         
         mixed_qkv = mixed_qkv.transpose(1, 2)  # (batch, seq_len, conv_dim)
         
@@ -417,34 +283,15 @@ class GatedDeltaNet(nn.Module):
         value = value.transpose(1, 2)
         
         # Apply gated delta rule
-        if use_cache_mode:
-            recurrent_state = past_key_value[1] if len(past_key_value) > 1 else None
-            core_attn_out, new_recurrent_state = self.recurrent_gated_delta_rule_fn(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=self.config.use_qk_l2norm,
-            )
-        else:
-            core_attn_out, new_recurrent_state = self.chunk_gated_delta_rule_fn(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                chunk_size=self.config.chunk_size,
-                initial_state=None,
-                output_final_state=use_cache,
-                use_qk_l2norm_in_kernel=self.config.use_qk_l2norm,
-            )
-        
-        # Update cache
-        if use_cache:
-            past_key_value = (conv_state, new_recurrent_state)
+        core_attn_out = self.chunk_gated_delta_rule_fn(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            chunk_size=self.config.chunk_size,
+            use_qk_l2norm_in_kernel=self.config.use_qk_l2norm,
+        )
         
         # Gated normalization
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
@@ -455,4 +302,4 @@ class GatedDeltaNet(nn.Module):
         # Output projection
         output = self.out_proj(core_attn_out)
         
-        return output, past_key_value
+        return output
